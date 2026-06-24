@@ -1,0 +1,170 @@
+{
+  "app_name": "LEO AI Studio",
+  "personality": "5 Brutalist Mobile",
+  "personality_one_liner": "A high-precision, technical creative studio leveraging sharp alignments, oversized grotesk typography, and stark monochrome surfaces punctuated by signal red to frame AI-generated art.",
+  "color": {
+    "surface": "#FFFFFF",
+    "onSurface": "#111111",
+    "surfaceSecondary": "#F4F4F4",
+    "onSurfaceSecondary": "#111111",
+    "surfaceTertiary": "#E5E5E5",
+    "onSurfaceTertiary": "#555555",
+    "surfaceInverse": "#111111",
+    "onSurfaceInverse": "#FFFFFF",
+    "brand": "#FF2A00",
+    "brandPrimary": "#FF2A00",
+    "onBrandPrimary": "#FFFFFF",
+    "brandSecondary": "#E62600",
+    "onBrandSecondary": "#FFFFFF",
+    "brandTertiary": "#FFD4CC",
+    "onBrandTertiary": "#FF2A00",
+    "success": "#00B050",
+    "onSuccess": "#FFFFFF",
+    "warning": "#FFB800",
+    "onWarning": "#111111",
+    "error": "#FF2A00",
+    "onError": "#FFFFFF",
+    "info": "#111111",
+    "onInfo": "#FFFFFF",
+    "border": "#E5E5E5",
+    "borderStrong": "#111111",
+    "divider": "#E5E5E5"
+  },
+  "typography": {
+    "displayFontFamily": "Space Grotesk",
+    "textFontFamily": "JetBrains Mono",
+    "scale": {
+      "sm": 12,
+      "base": 14,
+      "lg": 16,
+      "xl": 20,
+      "2xl": 24
+    }
+  },
+  "spacing": {
+    "rule": "Exposed spacing systems, edge-to-edge grids, structural dividers. 0 spacing around full-bleed canvases. Hard padding for forms.",
+    "xs": 4,
+    "sm": 8,
+    "md": 12,
+    "lg": 16,
+    "xl": 24,
+    "2xl": 32,
+    "3xl": 48
+  },
+  "radius_tokens": {
+    "sm": 0,
+    "md": 0,
+    "lg": 0,
+    "pill": 0
+  },
+  "shadow_tier": "0",
+  "navigation": "bottom_tabs",
+  "icon_set": "Feather",
+  "glassmorphism": {
+    "enabled": "false",
+    "do's": [
+      "Use solid surfaceSecondary or borderStrong dividers for overlays",
+      "Rely on hard 2pt borders to establish depth and hierarchy"
+    ],
+    "dont's": [
+      "Never use blur or glassmorphism",
+      "No soft drop shadows"
+    ]
+  },
+  "platform_libraries": {
+    "glass": {
+      "ios": "none",
+      "android": "none",
+      "low_end_android_fallback": "solid surfaceSecondary"
+    },
+    "image": "expo-image",
+    "blur": "none",
+    "bottom_sheet": "@gorhom/bottom-sheet",
+    "animation": "react-native-reanimated",
+    "gesture": "react-native-gesture-handler"
+  },
+  "screens": [
+    {
+      "name": "Home / Studio Hub",
+      "purpose": "The command center linking to the 5 creation modes and recent gallery.",
+      "states": {
+        "loading": "Centered monospace 'LOADING STUDIO_ENV...' with a stark linear progress bar.",
+        "empty": "No recent renders. 'AWAITING INPUT' in large mono text.",
+        "error": "Signal red block with white mono text detailing connection failure to LLM."
+      },
+      "layout": "Rigid edge-to-edge grid. Top: oversized 'LEO.AI' header with Google Profile block. Middle: 5 Mode cards stacked or in a tight grid. Cards have hard black 2pt borders (`borderStrong`), monochrome base, with high-contrast icons. Bottom: 'RECENT EXPORTS' horizontally scrolling strip with flush images (contact-sheet style)."
+    },
+    {
+      "name": "AI Prompt Composer Overlay",
+      "purpose": "Technical prompt interface for user text entry and LLM engine selection.",
+      "states": {
+        "loading": "Signal red pulse animation on the GENERATE button.",
+        "empty": "Input area blank, waiting for prompt.",
+        "error": "Error toast inline above the input area with hard red border."
+      },
+      "layout": "Bottom sheet or full-screen modal with 0 radius. JetBrains Mono used for text entry. A structural segmented control for Model Picker (Claude / GPT-5.2 / Gemini 3 Pro) with active state as black background / white text. Full-width Signal Red primary CTA button pinned at bottom."
+    },
+    {
+      "name": "3D Video Timeline Sequencer",
+      "purpose": "Timeline-based sequencer chaining scenes into video.",
+      "states": {
+        "loading": "Generating timeline sequence chunks...",
+        "empty": "Timeline empty, prompt to add first scene.",
+        "error": "Sequence render failure message."
+      },
+      "layout": "Upper 50% is the preview canvas. Lower 50% is the horizontal timeline. Timeline ruler displays short format (<1min) with dots for subdivisions using JetBrains Mono. Tracks are horizontal rows with hard borders. The playhead is a highly visible vertical Signal Red line (`brandPrimary`) cutting through the tracks. Track selection uses strong black outlines."
+    },
+    {
+      "name": "Gallery / Contact Sheet",
+      "purpose": "Showcase all generated outputs.",
+      "states": {
+        "loading": "Grid of solid surfaceSecondary rectangles.",
+        "empty": "Large mono 'ARCHIVE EMPTY'.",
+        "error": "Failed to load archive data."
+      },
+      "layout": "Dense 2 or 3 column grid with zero gaps (0 spacing). Hard 1pt black borders separating images. Tapping opens a full-screen viewer with a stark metadata overlay at the bottom (Prompt, Date, Engine) in JetBrains Mono text with a solid black backdrop (no glass)."
+    }
+  ],
+  "images": {
+    "scene_mode_bg": {
+      "url": "https://images.pexels.com/photos/17485741/pexels-photo-17485741.png",
+      "alt": "Intricate wireframe with dynamic ribbons in an abstract 3D composition"
+    },
+    "video_mode_bg": {
+      "url": "https://images.pexels.com/photos/34268919/pexels-photo-34268919.jpeg",
+      "alt": "Vibrant 3D abstract geometric pattern with yellow, violet, and white blocks"
+    },
+    "text_video_bg": {
+      "url": "https://images.pexels.com/photos/5981820/pexels-photo-5981820.jpeg",
+      "alt": "Bold yellow text EVERYTHING COUNTS on a black background"
+    },
+    "audio_visualizer_bg": {
+      "url": "https://images.unsplash.com/photo-1633164442172-dc4147f21954",
+      "alt": "Abstract image of red and blue waves"
+    },
+    "svg_art_bg": {
+      "url": "https://images.unsplash.com/photo-1605106702842-01a887a31122",
+      "alt": "Blue and white polka dot abstract SVG style textile"
+    }
+  },
+  "haptics": {
+    "events": {
+      "generate_button_press": "heavy",
+      "timeline_scrub": "light",
+      "timeline_snap": "medium",
+      "model_select": "selection",
+      "tab_change": "light"
+    }
+  },
+  "instructions_to_main_agent": [
+    "Strictly follow the Brutalist Mobile LIGHT personality. Do NOT use gradients, rounded corners, or shadows. Everything must be 0-radius and flat.",
+    "Use JetBrains Mono for all metadata, labels, model pickers, and timeline timestamps. Use Space Grotesk for large display headers.",
+    "Borders are a crucial structural element. Use borderStrong (1.5pt-2pt) to delineate cards, timeline tracks, and input fields.",
+    "The UI should feel like a technical command center, not a consumer social app.",
+    "For the timeline sequencer, implement a horizontal scrollable ruler with a static Playhead in the center, or a moving Playhead line in Signal Red.",
+    "Ensure 'AI Prompt Composer' model picker (Claude/GPT-5.2/Gemini) uses a hard, blocky segmented control design.",
+    "Gallery must be a zero-gap 'contact sheet' grid with hard borders separating the imagery.",
+    "All CTA buttons (like Generate) should be full-bleed or hard rectangular blocks, utilizing the Signal Red brand color.",
+    "Do NOT use indigo, blue, or purple anywhere in the system UI. The aesthetic must rely on monochrome (white/black/grey) + Signal Red."
+  ]
+}
