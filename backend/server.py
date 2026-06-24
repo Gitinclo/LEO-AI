@@ -46,6 +46,15 @@ NEW_USER_FREE_CREDITS = int(os.environ.get("NEW_USER_FREE_CREDITS", "5"))
 RAZORPAY_KEY_ID = os.environ.get("RAZORPAY_KEY_ID", "").strip()
 RAZORPAY_KEY_SECRET = os.environ.get("RAZORPAY_KEY_SECRET", "").strip()
 RAZORPAY_WEBHOOK_SECRET = os.environ.get("RAZORPAY_WEBHOOK_SECRET", "").strip()
+# Explicit admin allowlist (comma-separated emails). Replaces auto-first-user promotion.
+ADMIN_EMAILS = {
+    e.strip().lower()
+    for e in os.environ.get("ADMIN_EMAILS", "").split(",")
+    if e.strip()
+}
+# CORS allowlist (comma-separated). Defaults to "*" if unset for backwards compat.
+_cors_raw = os.environ.get("CORS_ORIGINS", "*").strip()
+CORS_ORIGINS = ["*"] if _cors_raw == "*" else [o.strip() for o in _cors_raw.split(",") if o.strip()]
 
 client = AsyncIOMotorClient(MONGO_URL)
 db = client[DB_NAME]
@@ -77,14 +86,35 @@ async def startup():
     await db.payments.create_index("user_id")
     await db.payments.create_index("payment_id", unique=True)
     await db.payments.create_index("status")
-    # Ensure first registered user becomes admin (one-time bootstrap)
-    has_admin = await db.users.find_one({"is_admin": True}, {"_id": 0})
-    if not has_admin:
-        first_user = await db.users.find_one({}, sort=[("created_at", 1)])
-        if first_user:
-            await db.users.update_one({"user_id": first_user["user_id"]}, {"$set": {"is_admin": True}})
-            logger.info(f"Bootstrapped admin: {first_user['email']}")
-    logger.info("Indexes ready")
+    # Index for rzp payment id (prevent replay). Partial filter so multiple
+    # documents may coexist with rzp_payment_id == null (pending orders).
+    # sparse=True alone does NOT skip explicit nulls — it only skips missing fields.
+    try:
+        await db.payments.create_index(
+            "rzp_payment_id",
+            unique=True,
+            partialFilterExpression={"rzp_payment_id": {"$type": "string"}},
+            name="rzp_payment_id_unique_str",
+        )
+    except Exception as e:
+        logger.warning(f"rzp_payment_id index create skipped: {e}")
+    # Drop legacy sparse-unique index if present (it conflicts on null values).
+    try:
+        await db.payments.drop_index("rzp_payment_id_1")
+    except Exception:
+        pass
+    # Sync admin flag from ADMIN_EMAILS env. Removes prior auto-promotion based on
+    # signup order (SEC-003). The allowlist is the source of truth.
+    if ADMIN_EMAILS:
+        await db.users.update_many(
+            {"email": {"$in": list(ADMIN_EMAILS)}}, {"$set": {"is_admin": True}}
+        )
+        await db.users.update_many(
+            {"email": {"$nin": list(ADMIN_EMAILS)}}, {"$set": {"is_admin": False}}
+        )
+    else:
+        await db.users.update_many({}, {"$set": {"is_admin": False}})
+    logger.info("Indexes ready · admin allowlist size=%d", len(ADMIN_EMAILS))
 
 
 @app.on_event("shutdown")
@@ -156,11 +186,16 @@ async def auth_session(req: SessionRequest):
         user_id = existing["user_id"]
         await db.users.update_one(
             {"user_id": user_id},
-            {"$set": {"name": name, "picture": picture, "last_login": datetime.now(timezone.utc)}},
+            {
+                "$set": {
+                    "name": name,
+                    "picture": picture,
+                    "last_login": datetime.now(timezone.utc),
+                    "is_admin": email.lower() in ADMIN_EMAILS,
+                }
+            },
         )
     else:
-        # First user becomes admin
-        is_admin = (await db.users.count_documents({})) == 0
         user_id = f"user_{uuid.uuid4().hex[:12]}"
         await db.users.insert_one(
             {
@@ -169,7 +204,7 @@ async def auth_session(req: SessionRequest):
                 "name": name,
                 "picture": picture,
                 "credits": NEW_USER_FREE_CREDITS,
-                "is_admin": is_admin,
+                "is_admin": email.lower() in ADMIN_EMAILS,
                 "created_at": datetime.now(timezone.utc),
                 "last_login": datetime.now(timezone.utc),
             }
@@ -266,7 +301,7 @@ PROVIDER_MAP = {
 
 class GenerateRequest(BaseModel):
     mode: str
-    prompt: str
+    prompt: str = Field(min_length=1, max_length=4000)
     model: str = "claude"
 
 
@@ -309,11 +344,11 @@ async def generate(req: GenerateRequest, authorization: Optional[str] = Header(N
         ).with_model(provider, model_name)
         out = await chat.send_message(UserMessage(text=req.prompt))
         text = getattr(out, "content", None) or str(out)
-    except Exception as e:
+    except Exception:
         # Refund credit on generation failure
         await db.users.update_one({"user_id": user["user_id"]}, {"$inc": {"credits": 1}})
         logger.exception("LLM call failed")
-        raise HTTPException(status_code=502, detail=f"llm error: {e}")
+        raise HTTPException(status_code=502, detail="generation engine unavailable, please retry")
 
     cleaned = _strip_fences(text)
     return {
@@ -330,11 +365,11 @@ async def generate(req: GenerateRequest, authorization: Optional[str] = Header(N
 # ---------- Gallery (Creations) ----------
 class CreationCreate(BaseModel):
     mode: str
-    prompt: str
+    prompt: str = Field(min_length=1, max_length=4000)
     model: str
-    model_display: str
-    output: str
-    title: Optional[str] = None
+    model_display: str = Field(max_length=64)
+    output: str = Field(max_length=200000)
+    title: Optional[str] = Field(default=None, max_length=200)
 
 
 class CreationOut(BaseModel):
@@ -504,9 +539,9 @@ async def razorpay_order(body: RzpOrderRequest, authorization: Optional[str] = H
                 "notes": {"user_id": user["user_id"], "email": user["email"], "credits": str(body.amount_inr)},
             }
         )
-    except Exception as e:
+    except Exception:
         logger.exception("razorpay order failed")
-        raise HTTPException(status_code=502, detail=f"razorpay order failed: {e}")
+        raise HTTPException(status_code=502, detail="payment provider unavailable")
 
     payment_id = f"pay_rzp_{uuid.uuid4().hex[:14]}"
     await db.payments.insert_one(
@@ -551,10 +586,26 @@ async def razorpay_verify(body: RzpVerifyRequest, authorization: Optional[str] =
     p = await db.payments.find_one({"payment_id": body.payment_id, "user_id": user["user_id"]}, {"_id": 0})
     if not p:
         raise HTTPException(status_code=404, detail="payment not found")
+    if p.get("method") != "razorpay":
+        raise HTTPException(status_code=400, detail="invalid payment method for verify")
     if p["status"] == "approved":
         return {"ok": True, "already_approved": True, "credits": p["credits"]}
 
-    # Verify HMAC-SHA256
+    # SEC-001 fix: bind submitted receipt to the order we created server-side.
+    # Refuse any verify whose rzp_order_id does not match the stored order on this payment.
+    if not p.get("rzp_order_id") or p["rzp_order_id"] != body.rzp_order_id:
+        raise HTTPException(status_code=400, detail="order mismatch")
+
+    # SEC-001 fix: reject replay — same rzp_payment_id must not be reused.
+    existing_use = await db.payments.find_one(
+        {"rzp_payment_id": body.rzp_payment_id, "payment_id": {"$ne": body.payment_id}},
+        {"_id": 0, "payment_id": 1},
+    )
+    if existing_use:
+        raise HTTPException(status_code=400, detail="payment already consumed")
+
+    # Verify HMAC-SHA256 over the SUBMITTED order|payment string. Combined with the
+    # order-mismatch check above, this proves the user actually completed THIS order.
     expected = hmac.new(
         RAZORPAY_KEY_SECRET.encode(),
         f"{body.rzp_order_id}|{body.rzp_payment_id}".encode(),
@@ -562,14 +613,15 @@ async def razorpay_verify(body: RzpVerifyRequest, authorization: Optional[str] =
     ).hexdigest()
     if not hmac.compare_digest(expected, body.rzp_signature):
         await db.payments.update_one(
-            {"payment_id": body.payment_id},
+            {"payment_id": body.payment_id, "status": {"$ne": "approved"}},
             {"$set": {"status": "rejected", "rejected_reason": "bad signature"}},
         )
         raise HTTPException(status_code=400, detail="signature verification failed")
 
+    # SEC-002 fix: atomic status transition — credit only if THIS call wins the race.
     now = datetime.now(timezone.utc)
-    await db.payments.update_one(
-        {"payment_id": body.payment_id},
+    transitioned = await db.payments.find_one_and_update(
+        {"payment_id": body.payment_id, "status": {"$ne": "approved"}},
         {
             "$set": {
                 "rzp_payment_id": body.rzp_payment_id,
@@ -578,7 +630,13 @@ async def razorpay_verify(body: RzpVerifyRequest, authorization: Optional[str] =
                 "approved_at": now,
             }
         },
+        projection={"_id": 0, "credits": 1, "status": 1},
+        return_document=True,
     )
+    if not transitioned:
+        # Lost the race — another concurrent request already approved this payment.
+        return {"ok": True, "already_approved": True, "credits": p["credits"]}
+
     await db.users.update_one({"user_id": user["user_id"]}, {"$inc": {"credits": p["credits"]}})
     new_user = await db.users.find_one({"user_id": user["user_id"]}, {"_id": 0, "credits": 1})
     return {"ok": True, "credits_added": p["credits"], "credits_balance": new_user.get("credits", 0)}
@@ -622,18 +680,28 @@ async def admin_pending(authorization: Optional[str] = Header(None)):
 @api.post("/admin/payments/{payment_id}/approve")
 async def admin_approve(payment_id: str, authorization: Optional[str] = Header(None)):
     admin = await require_admin(authorization)
-    p = await db.payments.find_one({"payment_id": payment_id}, {"_id": 0})
-    if not p:
-        raise HTTPException(status_code=404, detail="not found")
-    if p["status"] == "approved":
-        return {"ok": True, "already_approved": True}
+    # SEC-002 fix: atomic status transition. Only credit if THIS call flips the state.
     now = datetime.now(timezone.utc)
-    await db.payments.update_one(
-        {"payment_id": payment_id},
-        {"$set": {"status": "approved", "approved_at": now, "approved_by": admin["email"]}},
+    transitioned = await db.payments.find_one_and_update(
+        {"payment_id": payment_id, "status": {"$ne": "approved"}},
+        {
+            "$set": {
+                "status": "approved",
+                "approved_at": now,
+                "approved_by": admin["email"],
+            }
+        },
+        projection={"_id": 0, "user_id": 1, "credits": 1},
+        return_document=True,
     )
-    await db.users.update_one({"user_id": p["user_id"]}, {"$inc": {"credits": p["credits"]}})
-    return {"ok": True, "credits_added": p["credits"]}
+    if not transitioned:
+        # Either not found or already approved.
+        existing = await db.payments.find_one({"payment_id": payment_id}, {"_id": 0, "status": 1})
+        if not existing:
+            raise HTTPException(status_code=404, detail="not found")
+        return {"ok": True, "already_approved": True}
+    await db.users.update_one({"user_id": transitioned["user_id"]}, {"$inc": {"credits": transitioned["credits"]}})
+    return {"ok": True, "credits_added": transitioned["credits"]}
 
 
 @api.post("/admin/payments/{payment_id}/reject")
@@ -659,8 +727,8 @@ app.include_router(api)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_credentials=True,
-    allow_origins=["*"],
+    allow_credentials=("*" not in CORS_ORIGINS),
+    allow_origins=CORS_ORIGINS,
     allow_methods=["*"],
     allow_headers=["*"],
 )

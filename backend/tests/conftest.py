@@ -57,7 +57,6 @@ def creds():
                     "created_at": datetime.now(timezone.utc),
                     "last_login": datetime.now(timezone.utc),
                 })
-            # Clean prior sessions
             await db.user_sessions.delete_many({"user_id": user_id})
             token = f"test_{uuid.uuid4().hex}"
             await db.user_sessions.insert_one({
@@ -66,12 +65,31 @@ def creds():
                 "expires_at": datetime.now(timezone.utc) + timedelta(days=7),
                 "created_at": datetime.now(timezone.utc),
             })
-            # Cleanup any prior TEST payments for this user
             await db.payments.delete_many({"user_id": user_id})
             result[key] = {"user_id": user_id, "token": token, "email": email, "is_admin": is_admin, "credits": credits}
         client.close()
         return result
-    return asyncio.get_event_loop().run_until_complete(setup()) if False else asyncio.new_event_loop().run_until_complete(setup())
+    return asyncio.new_event_loop().run_until_complete(setup())
+
+
+@pytest.fixture(autouse=True)
+def _ensure_user_a_admin(creds):
+    """Some SEC-003 tests mutate is_admin via update_many; restore A's admin flag
+    around every test so admin-gated tests don't flake."""
+    async def restore():
+        c = AsyncIOMotorClient(MONGO_URL)
+        await c[DB_NAME].users.update_one(
+            {"user_id": creds["user_a"]["user_id"]},
+            {"$set": {"is_admin": True}},
+        )
+        await c[DB_NAME].users.update_one(
+            {"user_id": creds["user_b"]["user_id"]},
+            {"$set": {"is_admin": False}},
+        )
+        c.close()
+    asyncio.new_event_loop().run_until_complete(restore())
+    yield
+    asyncio.new_event_loop().run_until_complete(restore())
 
 
 @pytest.fixture

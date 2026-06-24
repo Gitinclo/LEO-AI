@@ -31,7 +31,8 @@ class TestWallet:
         ids = {p["id"] for p in d["plans"]}
         assert ids == {"monthly", "topup_100", "topup_500"}
         assert d["rate"]["credits_per_inr"] == 1
-        assert d["razorpay_enabled"] is False
+        # razorpay_enabled depends on env keys; both states are valid shape-wise
+        assert isinstance(d["razorpay_enabled"], bool)
         assert d["upi_enabled"] is True
 
     def test_wallet_non_admin_flag(self, base_url, client_b):
@@ -124,8 +125,13 @@ class TestUPI:
         assert r.status_code == 422
 
 
-# ---------- Razorpay 503 ----------
+# ---------- Razorpay (503 fallback when not configured) ----------
 class TestRazorpay503:
+    @pytest.fixture(autouse=True)
+    def _skip_if_enabled(self, base_url, client_a):
+        if client_a.get(f"{base_url}/api/wallet").json().get("razorpay_enabled"):
+            pytest.skip("razorpay configured — 503 fallback path not exercised")
+
     def test_order_503(self, base_url, client_a):
         r = client_a.post(f"{base_url}/api/payments/razorpay/order", json={"amount_inr": 500})
         assert r.status_code == 503, r.text

@@ -1,0 +1,53 @@
+{
+  "summary": "Iteration 3 — security audit fix verification. 29 PASSED / 2 SKIPPED / 0 FAILED (skips are TestRazorpay503 fallback, correctly skipped because Razorpay test keys are now configured). All SEC-001 (Razorpay verify hardening: order binding, replay block, cross-method block), SEC-002 (atomic concurrency on admin approve + razorpay verify — 5 concurrent calls credit exactly once), SEC-003 (no auto-admin; ADMIN_EMAILS allowlist is source of truth; oldest-user-promotion removed), and P3 size caps (prompt 4000, output 200000) verified end-to-end against the live backend. Iteration-2 regression (wallet shape, credit deduction, UPI intent + UTR + admin approve/reject e2e, cross-user isolation, payment listing) still PASS. NOTE: found and fixed a CRITICAL production bug introduced by the SEC-001 fix — see rca_of_issue.",
+  "backend_issues": {
+    "critical": [
+      {
+        "endpoint": "POST /api/payments/razorpay/order  (caused by startup index)",
+        "issue": "FIXED in this iteration. The new `db.payments.create_index('rzp_payment_id', sparse=True, unique=True)` rejected the SECOND razorpay order ever created with DuplicateKeyError because the server inserts `rzp_payment_id: null` on every new order, and `sparse=True` only excludes documents where the field is ABSENT, not where it is explicit null. Replaced with a partialFilterExpression unique index (`{rzp_payment_id: {$type: 'string'}}`) that ignores nulls. Legacy `rzp_payment_id_1` index is auto-dropped on startup. Without this fix, no user could create more than one razorpay order across the database.",
+        "priority": "CRITICAL"
+      }
+    ],
+    "minor": [
+      {"endpoint": "POST /api/payments/razorpay/verify", "issue": "On bad-signature path the payment is flipped to status='rejected' before the atomic transition block — a later retry with the CORRECT signature will then fail the `status:{$ne:'approved'}` filter only if also rejected? Actually it currently transitions from rejected→approved (since filter is $ne:'approved'), so retry still works. But the user-visible record will briefly show 'rejected'. Consider keeping status='pending' on signature mismatch instead and emitting a counter."},
+      {"endpoint": "@app.on_event('startup')", "issue": "FastAPI ≥0.110 deprecates on_event. Migrate to lifespan context manager."}
+    ]
+  },
+  "frontend_issues": {
+    "ui_bugs": [],
+    "integration_issues": [],
+    "design_issues": [],
+    "react_native_issues": []
+  },
+  "test_report_links": [
+    "/app/backend/tests/test_security_iter3.py",
+    "/app/backend/tests/test_wallet_and_payments.py",
+    "/app/backend/tests/conftest.py",
+    "/app/test_reports/pytest/pytest_iter3.xml"
+  ],
+  "action_items": [
+    "Validate the index migration fix on a clean database (drop test_database.payments collection or pre-existing rzp_payment_id_1 index in prod) — startup auto-drops legacy index then creates the partial one.",
+    "Consider lifespan migration off @app.on_event (Pydantic/FastAPI deprecation).",
+    "Consider keeping payment status='pending' on bad-signature instead of flipping to 'rejected' to allow clean retries from the frontend without surprising users.",
+    "If you want strict invariants, also create unique index `(rzp_order_id)` partial on `method=='razorpay'` to prevent two server-side payments sharing the same Razorpay order (defense in depth for SEC-001)."
+  ],
+  "critical_code_review_comments": [
+    "server.py is ~720 lines — past the 700-line threshold. Split into routers (auth, llm, gallery, wallet, payments_upi, payments_razorpay, admin).",
+    "Razorpay verify happy path mutates `rzp_payment_id` (previously null → real id) under the new partial-unique index. Fine because partial index only enforces uniqueness when value is a string.",
+    "ADMIN_EMAILS startup sync uses two update_many calls — works but could be a single bulk_write for atomicity.",
+    "Test fixture `creds` is session-scoped; SEC-003 tests mutate is_admin via update_many — added an autouse `_ensure_user_a_admin` fixture in conftest.py to restore A=admin / B=non-admin around every test, so admin-gated tests no longer flake when ordered after SEC-003.",
+    "The `RzpVerifyRequest` model accepts raw signature/payment_id strings without max_length — consider Field(max_length=128) to bound input."
+  ],
+  "updated_files": [
+    "/app/backend/server.py (replaced sparse-unique with partial-unique index + auto-drop legacy index)",
+    "/app/backend/tests/conftest.py (added autouse _ensure_user_a_admin fixture)",
+    "/app/backend/tests/test_wallet_and_payments.py (relaxed razorpay_enabled assertion; auto-skip TestRazorpay503 when enabled)",
+    "/app/backend/tests/test_security_iter3.py (new — 11 security tests for SEC-001/002/003 + P3 caps)"
+  ],
+  "success_rate": {"backend": "100% (29/29 executed, 2 intentionally skipped)", "frontend": "not_tested"},
+  "seed_data_creation": "Uses existing conftest seed (TEST_userA@leo.ai admin, TEST_userB@leo.ai non-admin). Security tests additionally seed throwaway razorpay payment rows via direct Mongo insert (so HMAC paths are exercised without calling Razorpay's /order). All test data prefixed TEST_ for identification.",
+  "retest_needed": false,
+  "should_main_agent_self_test": true,
+  "context_for_next_testing_agent": "Run `pytest /app/backend/tests/ -v --junitxml=/app/test_reports/pytest/pytest_iter3.xml`. Razorpay test keys are real and active in /app/backend/.env. SEC-003 tests mutate is_admin via update_many — conftest has an autouse fixture that restores user_a admin around every test; do NOT remove it. The legacy index `rzp_payment_id_1` is auto-dropped at startup; if you ever see DuplicateKeyError on `rzp_payment_id: null`, the new partial index didn't get applied — restart backend.",
+  "rca_of_issue": "BUG (introduced by SEC-001 fix, found & fixed this iteration): The fix added `db.payments.create_index('rzp_payment_id', sparse=True, unique=True)` to prevent replay. In MongoDB, `sparse=True` only skips documents where the indexed field is ABSENT — it does NOT skip documents where the field is explicitly `null`. Since `razorpay_order` inserts every new payment with `rzp_payment_id: None`, the FIRST razorpay order creates a null entry in the index, and any SUBSEQUENT razorpay order anywhere in the database fails with `E11000 duplicate key error ... dup key: { rzp_payment_id: null }`. Reproduction: hit POST /api/payments/razorpay/order twice in a row → second returns 500. Mitigation applied: replaced with a partial unique index `partialFilterExpression={rzp_payment_id: {$type: 'string'}}` which only enforces uniqueness on string values (i.e., actual rzp payment ids), allowing many nulls to coexist while still blocking replay of any specific rzp_payment_id. Startup also drops the legacy `rzp_payment_id_1` index for forward migration. Verified end-to-end by SEC-001 and SEC-002 tests (5 concurrent verifies, replay attempt — all behave correctly)."
+}

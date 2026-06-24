@@ -451,18 +451,21 @@ function RazorpayCheckoutModal({
 
   const html = useMemo(() => {
     if (!order) return "";
+    // SEC: prevent </script> breakout when injecting JS string literals.
+    const safe = (v: string) =>
+      JSON.stringify(v ?? "").replace(/</g, "\\u003c").replace(/>/g, "\\u003e");
     return `<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><style>html,body{margin:0;padding:0;background:#fff;font-family:system-ui;height:100%;display:flex;align-items:center;justify-content:center;color:#111}.box{padding:32px;text-align:center}</style></head><body>
 <div class='box'><p>Loading checkout...</p></div>
 <script src='https://checkout.razorpay.com/v1/checkout.js'></script>
 <script>
   const opts = {
-    key: ${JSON.stringify(order.rzp_key_id)},
+    key: ${safe(order.rzp_key_id)},
     amount: ${order.amount_paise},
     currency: 'INR',
-    name: ${JSON.stringify(order.merchant_name)},
+    name: ${safe(order.merchant_name)},
     description: 'LEO AI Credits',
-    order_id: ${JSON.stringify(order.rzp_order_id)},
-    prefill: { name: ${JSON.stringify(order.user_name)}, email: ${JSON.stringify(order.user_email)} },
+    order_id: ${safe(order.rzp_order_id)},
+    prefill: { name: ${safe(order.user_name)}, email: ${safe(order.user_email)} },
     theme: { color: '#FF2A00' },
     handler: function(res) {
       window.ReactNativeWebView.postMessage(JSON.stringify({ type: 'success', ...res }));
