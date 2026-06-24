@@ -1,0 +1,43 @@
+{
+  "summary": "Backend-only iteration covering wallet, credit deduction in /generate, UPI deep-link + UTR submit, Razorpay 503 fallback, payments listing, and admin approve/reject end-to-end. 20/20 pytest cases PASS. Notable: /api/generate properly deducts 1 credit on success and refunds on LLM failure; /api/wallet returns the expected 3 plans, rate.credits_per_inr=1, razorpay_enabled=false, upi_enabled=true; UPI intent returns valid upi:// deep-link with merchant id creatergame31@oksbi; admin gate enforced (403 for non-admin); approve increments credits and rejected does not; e2e: ₹50 UPI intent → UTR submit → admin approve → user credit +50 → spend via /generate succeeded.",
+  "backend_issues": {
+    "critical": [],
+    "minor": [
+      {"endpoint": "POST /api/payments/upi/submit-utr", "issue": "Field constraint min_length=6 rejects UTRs <6 chars at the model layer; real Indian UTR is exactly 12 digits — consider tightening to exactly 12 with a regex for stricter validation. Not a bug, just a hardening note."},
+      {"endpoint": "POST /api/generate", "issue": "Response field `credits_remaining` is computed as `updated.get('credits', 0) - 0` with a stale comment ('# post-decrement value (returned doc already decremented)'). Value is correct (return_document=True returns the post-update doc), but the `- 0` and comment are confusing; consider cleaning up."}
+    ]
+  },
+  "frontend_issues": {
+    "ui_bugs": [],
+    "integration_issues": [],
+    "design_issues": [],
+    "react_native_issues": []
+  },
+  "test_report_links": [
+    "/app/backend/tests/test_wallet_and_payments.py",
+    "/app/backend/tests/conftest.py",
+    "/app/test_reports/pytest/pytest_results.xml"
+  ],
+  "action_items": [
+    "(Optional) Tighten UTR validation to a 12-digit numeric regex.",
+    "(Optional) Remove the `- 0` and stale comment on the /generate credits_remaining field.",
+    "Razorpay endpoints intentionally return 503 today; when keys are configured remember to re-run TestRazorpay503 expectations (they will then fail by design)."
+  ],
+  "critical_code_review_comments": [
+    "Server is starting to bloat (~666 lines). Once Razorpay integration grows further, split into routers: auth.py, llm.py, gallery.py, wallet.py, payments_upi.py, payments_razorpay.py, admin.py.",
+    "Admin bootstrap uses @app.on_event('startup') (deprecated in FastAPI ≥0.110). Migrate to lifespan context for forward compatibility.",
+    "/api/generate uses find_one_and_update for atomic deduction — good. Confirm `return_document=ReturnDocument.AFTER` semantics: motor's `return_document=True` is equivalent and correct here.",
+    "POST /api/payments/upi/submit-utr only blocks final states ('approved','rejected') — currently good. Consider also blocking idempotent re-submits of a different UTR after `utr_submitted` if business rules require it.",
+    "Razorpay verify failure path marks the payment 'rejected' which mutates state on bad signature — acceptable but be aware retries with the correct signature later will see status='rejected' and short-circuit. Consider only marking rejected after N attempts, or leaving status='pending'."
+  ],
+  "updated_files": [
+    "/app/backend/tests/conftest.py (new)",
+    "/app/backend/tests/test_wallet_and_payments.py (new)"
+  ],
+  "success_rate": {"backend": "100%", "frontend": "not_tested"},
+  "seed_data_creation": "Fixture seeds two MongoDB users — TEST_userA@leo.ai (is_admin=true, credits=10) and TEST_userB@leo.ai (is_admin=false, credits=0) — plus bearer session tokens, and clears prior payments for both. Idempotent across runs.",
+  "retest_needed": false,
+  "should_main_agent_self_test": false,
+  "context_for_next_testing_agent": "Use /app/backend/tests/conftest.py fixtures (creds, client_a admin, client_b non-admin, base_url from EXPO_PUBLIC_BACKEND_URL). Note frontend env var is EXPO_PUBLIC_BACKEND_URL (not EXPO_BACKEND_URL). Razorpay tests EXPECT 503 until RAZORPAY_KEY_ID/SECRET are populated — update those tests when keys are added. /api/generate may occasionally return 502 from upstream LLM; tests already tolerate this and verify the refund path.",
+  "rca_of_issue": "N/A — no regressions found this iteration."
+}

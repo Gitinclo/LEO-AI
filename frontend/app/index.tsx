@@ -1,7 +1,7 @@
 /**
  * Home / Studio Hub — entry to the 5 creation modes + profile + gallery.
  */
-import React from "react";
+import React, { useEffect } from "react";
 import {
   Pressable,
   ScrollView,
@@ -11,20 +11,26 @@ import {
   Image,
 } from "react-native";
 import { SafeAreaView, useSafeAreaInsets } from "react-native-safe-area-context";
-import { router } from "expo-router";
+import { router, useFocusEffect } from "expo-router";
 import { Feather } from "@expo/vector-icons";
 import { useAuth } from "@/src/auth";
 import { C, FONT, FS, MODES, SP } from "@/src/theme";
 
 export default function Home() {
   const insets = useSafeAreaInsets();
-  const { user } = useAuth();
+  const { user, refreshUser } = useAuth();
   const initials = (user?.name || user?.email || "??")
     .split(/\s+/)
     .map((p) => p[0])
     .slice(0, 2)
     .join("")
     .toUpperCase();
+
+  useFocusEffect(
+    React.useCallback(() => {
+      refreshUser();
+    }, [refreshUser])
+  );
 
   return (
     <SafeAreaView style={s.root} edges={["top"]} testID="home-screen">
@@ -54,7 +60,17 @@ export default function Home() {
 
         <View style={s.statusBar}>
           <Text style={s.statusText}>OPERATOR: {(user?.name || "GUEST").toUpperCase()}</Text>
-          <Text style={s.statusText}>READY</Text>
+          <Pressable
+            onPress={() => router.push("/wallet")}
+            style={s.creditsPill}
+            testID="credits-pill"
+            hitSlop={8}
+          >
+            <Feather name="zap" size={12} color={C.brand} />
+            <Text style={s.creditsPillText}>
+              {user?.credits ?? 0} CR
+            </Text>
+          </Pressable>
         </View>
 
         {/* MODES GRID */}
@@ -147,11 +163,23 @@ const s = StyleSheet.create({
   statusBar: {
     flexDirection: "row",
     justifyContent: "space-between",
+    alignItems: "center",
     paddingHorizontal: SP.lg,
     paddingVertical: SP.sm,
     backgroundColor: C.surfaceInverse,
   },
   statusText: { fontFamily: FONT.mono, fontSize: FS.sm, color: C.onSurfaceInverse, letterSpacing: 1 },
+  creditsPill: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 4,
+    paddingHorizontal: SP.sm,
+    paddingVertical: 4,
+    backgroundColor: C.surface,
+    borderWidth: 1,
+    borderColor: C.brand,
+  },
+  creditsPillText: { fontFamily: FONT.mono, fontSize: FS.sm, color: C.onSurface, letterSpacing: 1, fontWeight: "700" },
   modesWrap: { paddingHorizontal: SP.lg, marginTop: SP.lg },
   sectionLabel: {
     fontFamily: FONT.mono,

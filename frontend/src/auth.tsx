@@ -16,6 +16,8 @@ export type LeoUser = {
   email: string;
   name: string;
   picture?: string | null;
+  credits?: number;
+  is_admin?: boolean;
 };
 
 type AuthState = {
@@ -25,6 +27,7 @@ type AuthState = {
   login: () => Promise<void>;
   logout: () => Promise<void>;
   authFetch: (path: string, init?: RequestInit) => Promise<Response>;
+  refreshUser: () => Promise<void>;
 };
 
 const Ctx = createContext<AuthState | null>(null);
@@ -214,9 +217,22 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     [token]
   );
 
+  const refreshUser = useCallback(async () => {
+    if (!token) return;
+    try {
+      const r = await fetch(`${BASE}/api/auth/me`, {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      if (r.ok) {
+        const u = await r.json();
+        setUser(u);
+      }
+    } catch {}
+  }, [token]);
+
   const value = useMemo<AuthState>(
-    () => ({ loading, user, token, login, logout, authFetch }),
-    [loading, user, token, login, logout, authFetch]
+    () => ({ loading, user, token, login, logout, authFetch, refreshUser }),
+    [loading, user, token, login, logout, authFetch, refreshUser]
   );
 
   return <Ctx.Provider value={value}>{children}</Ctx.Provider>;

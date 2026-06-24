@@ -17,7 +17,6 @@ import { router } from 'expo-router';
 import { C, FONT, FS, SP, type ModeId, type ModelId } from './theme';
 import { PromptComposer } from './PromptComposer';
 import { useAuth } from './auth';
-
 type Props = {
   mode: ModeId;
   modeCode: string;
@@ -38,10 +37,11 @@ export function StudioScreen({
   defaultPrompt,
 }: Props) {
   const insets = useSafeAreaInsets();
-  const { authFetch } = useAuth();
+  const { authFetch, refreshUser, user } = useAuth();
   const [composerOpen, setComposerOpen] = useState(false);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [noCredits, setNoCredits] = useState(false);
   const [output, setOutput] = useState<string | null>(null);
   const [lastPrompt, setLastPrompt] = useState<string>('');
   const [lastModel, setLastModel] = useState<ModelId>('claude');
@@ -51,6 +51,7 @@ export function StudioScreen({
 
   const handleGenerate = async (prompt: string, model: ModelId) => {
     setError(null);
+    setNoCredits(false);
     setLoading(true);
     setSavedId(null);
     try {
@@ -59,6 +60,11 @@ export function StudioScreen({
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ mode, prompt, model }),
       });
+      if (r.status === 402) {
+        setNoCredits(true);
+        setComposerOpen(false);
+        return;
+      }
       if (!r.ok) {
         const text = await r.text();
         throw new Error(`HTTP ${r.status}: ${text.slice(0, 120)}`);
@@ -69,6 +75,7 @@ export function StudioScreen({
       setLastModel(data.model);
       setLastDisplay(data.model_display);
       setComposerOpen(false);
+      refreshUser();
     } catch (e: any) {
       setError(e?.message || 'Generation failed');
     } finally {
@@ -119,7 +126,15 @@ export function StudioScreen({
       </View>
       <View style={s.subBar}>
         <Text style={s.sub}>{modeSub.toUpperCase()}</Text>
-        <Text style={s.sub}>STATE: {output ? 'LOADED' : loading ? 'GENERATING' : 'IDLE'}</Text>
+        <Pressable
+          onPress={() => router.push('/wallet')}
+          style={s.creditsChip}
+          testID="studio-credits-chip"
+          hitSlop={8}
+        >
+          <Feather name="zap" size={11} color={C.brand} />
+          <Text style={s.creditsChipText}>{user?.credits ?? 0} CR</Text>
+        </Pressable>
       </View>
 
       <ScrollView
@@ -137,12 +152,27 @@ export function StudioScreen({
               </Text>
             </View>
           )}
-          {!loading && !output && !error && (
+          {!loading && !output && !error && !noCredits && (
             <View style={s.center}>
               <Text style={s.placeholderTitle}>AWAITING INPUT</Text>
               <Text style={[s.mono, { color: C.onSurfaceTertiary, marginTop: SP.sm }]}>
                 TAP COMPOSE TO GENERATE
               </Text>
+            </View>
+          )}
+          {!loading && noCredits && (
+            <View style={s.noCreditsBlock} testID="no-credits-block">
+              <Text style={s.noCreditsTitle}>OUT OF CREDITS</Text>
+              <Text style={s.noCreditsBody}>
+                EACH GENERATION COSTS 1 CREDIT. TOP UP YOUR WALLET TO KEEP CREATING.
+              </Text>
+              <Pressable
+                onPress={() => router.push('/wallet/buy')}
+                style={s.noCreditsBtn}
+                testID="goto-buy-credits-button"
+              >
+                <Text style={s.noCreditsBtnText}>+ BUY CREDITS</Text>
+              </Pressable>
             </View>
           )}
           {!loading && error && (
@@ -241,6 +271,39 @@ const s = StyleSheet.create({
     backgroundColor: C.surfaceInverse,
   },
   sub: { fontFamily: FONT.mono, fontSize: FS.sm, color: C.onSurfaceInverse, letterSpacing: 1 },
+  creditsChip: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 4,
+    paddingHorizontal: SP.sm,
+    paddingVertical: 2,
+    backgroundColor: C.surface,
+    borderWidth: 1,
+    borderColor: C.brand,
+  },
+  creditsChipText: { fontFamily: FONT.mono, fontSize: FS.sm, color: C.onSurface, letterSpacing: 1, fontWeight: '700' },
+  noCreditsBlock: {
+    borderWidth: 2,
+    borderColor: C.borderStrong,
+    padding: SP.lg,
+    width: '100%',
+    backgroundColor: C.surfaceInverse,
+    alignItems: 'center',
+  },
+  noCreditsTitle: {
+    fontFamily: FONT.display, fontSize: FS['3xl'], fontWeight: '900',
+    color: C.onSurfaceInverse, letterSpacing: -1,
+  },
+  noCreditsBody: {
+    fontFamily: FONT.mono, fontSize: FS.sm, color: '#cccccc',
+    letterSpacing: 0.5, lineHeight: 20, marginTop: SP.md, textAlign: 'center',
+  },
+  noCreditsBtn: {
+    marginTop: SP.lg, backgroundColor: C.brand, paddingHorizontal: SP.xl, paddingVertical: SP.lg,
+  },
+  noCreditsBtnText: {
+    fontFamily: FONT.mono, fontSize: FS.lg, color: C.onSurfaceInverse, letterSpacing: 2, fontWeight: '700',
+  },
   outputArea: { alignItems: 'center', minHeight: 340, justifyContent: 'center' },
   center: { alignItems: 'center', padding: SP.xl },
   placeholderTitle: {

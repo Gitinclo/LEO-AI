@@ -1,18 +1,31 @@
 """LEO AI Studio — Backend
 Endpoints:
-  - Auth: POST /api/auth/session, GET /api/auth/me, POST /api/auth/logout
-  - LLM:  POST /api/generate
-  - Gallery: GET/POST/DELETE /api/creations
+  - Auth:      POST /api/auth/session, GET /api/auth/me, POST /api/auth/logout
+  - LLM:       POST /api/generate              (deducts 1 credit; 402 if empty)
+  - Gallery:   GET/POST/DELETE /api/creations
+  - Wallet:    GET /api/wallet
+  - Payments:  POST /api/payments/upi/intent
+               POST /api/payments/upi/submit-utr
+               POST /api/payments/razorpay/order
+               POST /api/payments/razorpay/verify
+               GET  /api/payments/me
+  - Admin:     GET  /api/admin/payments/pending
+               POST /api/admin/payments/{payment_id}/approve
+               POST /api/admin/payments/{payment_id}/reject
 """
+import hashlib
+import hmac
 import logging
 import os
 import re
 import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Optional
+from typing import Literal, Optional
+from urllib.parse import quote
 
 import httpx
+import razorpay
 from dotenv import load_dotenv
 from fastapi import APIRouter, FastAPI, Header, HTTPException, Request
 from motor.motor_asyncio import AsyncIOMotorClient
@@ -27,9 +40,22 @@ load_dotenv(ROOT_DIR / ".env")
 MONGO_URL = os.environ["MONGO_URL"]
 DB_NAME = os.environ["DB_NAME"]
 EMERGENT_LLM_KEY = os.environ["EMERGENT_LLM_KEY"]
+MERCHANT_UPI_ID = os.environ.get("MERCHANT_UPI_ID", "")
+MERCHANT_NAME = os.environ.get("MERCHANT_NAME", "LEO AI Studio")
+NEW_USER_FREE_CREDITS = int(os.environ.get("NEW_USER_FREE_CREDITS", "5"))
+RAZORPAY_KEY_ID = os.environ.get("RAZORPAY_KEY_ID", "").strip()
+RAZORPAY_KEY_SECRET = os.environ.get("RAZORPAY_KEY_SECRET", "").strip()
+RAZORPAY_WEBHOOK_SECRET = os.environ.get("RAZORPAY_WEBHOOK_SECRET", "").strip()
 
 client = AsyncIOMotorClient(MONGO_URL)
 db = client[DB_NAME]
+
+razorpay_client = None
+if RAZORPAY_KEY_ID and RAZORPAY_KEY_SECRET:
+    try:
+        razorpay_client = razorpay.Client(auth=(RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET))
+    except Exception as e:
+        logging.warning(f"Razorpay init failed: {e}")
 
 app = FastAPI(title="LEO AI Studio")
 api = APIRouter(prefix="/api")
@@ -38,7 +64,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(level
 logger = logging.getLogger("leo.ai")
 
 
-# ---------- Startup: indexes ----------
+# ---------- Startup ----------
 @app.on_event("startup")
 async def startup():
     await db.users.create_index("email", unique=True)
@@ -48,6 +74,16 @@ async def startup():
     await db.user_sessions.create_index("expires_at", expireAfterSeconds=0)
     await db.creations.create_index("user_id")
     await db.creations.create_index("created_at")
+    await db.payments.create_index("user_id")
+    await db.payments.create_index("payment_id", unique=True)
+    await db.payments.create_index("status")
+    # Ensure first registered user becomes admin (one-time bootstrap)
+    has_admin = await db.users.find_one({"is_admin": True}, {"_id": 0})
+    if not has_admin:
+        first_user = await db.users.find_one({}, sort=[("created_at", 1)])
+        if first_user:
+            await db.users.update_one({"user_id": first_user["user_id"]}, {"$set": {"is_admin": True}})
+            logger.info(f"Bootstrapped admin: {first_user['email']}")
     logger.info("Indexes ready")
 
 
@@ -77,6 +113,13 @@ async def get_current_user(authorization: Optional[str] = Header(None)):
     return user
 
 
+async def require_admin(authorization: Optional[str] = Header(None)):
+    user = await get_current_user(authorization)
+    if not user.get("is_admin"):
+        raise HTTPException(status_code=403, detail="admin only")
+    return user
+
+
 # ---------- Auth models ----------
 class SessionRequest(BaseModel):
     session_id: str
@@ -87,11 +130,12 @@ class PublicUser(BaseModel):
     email: str
     name: str
     picture: Optional[str] = None
+    credits: int = 0
+    is_admin: bool = False
 
 
 @api.post("/auth/session")
 async def auth_session(req: SessionRequest):
-    """Exchange Emergent session_id for our session_token + persist user."""
     if not req.session_id:
         raise HTTPException(status_code=400, detail="session_id required")
     async with httpx.AsyncClient(timeout=20) as hc:
@@ -115,6 +159,8 @@ async def auth_session(req: SessionRequest):
             {"$set": {"name": name, "picture": picture, "last_login": datetime.now(timezone.utc)}},
         )
     else:
+        # First user becomes admin
+        is_admin = (await db.users.count_documents({})) == 0
         user_id = f"user_{uuid.uuid4().hex[:12]}"
         await db.users.insert_one(
             {
@@ -122,6 +168,8 @@ async def auth_session(req: SessionRequest):
                 "email": email,
                 "name": name,
                 "picture": picture,
+                "credits": NEW_USER_FREE_CREDITS,
+                "is_admin": is_admin,
                 "created_at": datetime.now(timezone.utc),
                 "last_login": datetime.now(timezone.utc),
             }
@@ -140,9 +188,17 @@ async def auth_session(req: SessionRequest):
         },
         upsert=True,
     )
+    user = await db.users.find_one({"user_id": user_id}, {"_id": 0})
     return {
         "session_token": session_token,
-        "user": {"user_id": user_id, "email": email, "name": name, "picture": picture},
+        "user": {
+            "user_id": user["user_id"],
+            "email": user["email"],
+            "name": user["name"],
+            "picture": user.get("picture"),
+            "credits": user.get("credits", 0),
+            "is_admin": bool(user.get("is_admin")),
+        },
     }
 
 
@@ -154,6 +210,8 @@ async def auth_me(authorization: Optional[str] = Header(None)):
         email=user["email"],
         name=user["name"],
         picture=user.get("picture"),
+        credits=user.get("credits", 0),
+        is_admin=bool(user.get("is_admin")),
     )
 
 
@@ -209,12 +267,11 @@ PROVIDER_MAP = {
 class GenerateRequest(BaseModel):
     mode: str
     prompt: str
-    model: str = "claude"  # "claude" | "gpt" | "gemini"
+    model: str = "claude"
 
 
 def _strip_fences(text: str) -> str:
     text = text.strip()
-    # Remove ```json ... ``` or ``` ... ```
     fence = re.match(r"^```(?:json|svg|xml)?\s*\n?(.*?)\n?```\s*$", text, re.DOTALL)
     if fence:
         return fence.group(1).strip()
@@ -228,6 +285,20 @@ async def generate(req: GenerateRequest, authorization: Optional[str] = Header(N
         raise HTTPException(status_code=400, detail=f"invalid mode: {req.mode}")
     if req.model not in PROVIDER_MAP:
         raise HTTPException(status_code=400, detail=f"invalid model: {req.model}")
+
+    # Atomic credit deduction (-1 if credits >= 1)
+    updated = await db.users.find_one_and_update(
+        {"user_id": user["user_id"], "credits": {"$gte": 1}},
+        {"$inc": {"credits": -1}},
+        projection={"_id": 0, "credits": 1},
+        return_document=True,
+    )
+    if not updated:
+        raise HTTPException(
+            status_code=402,
+            detail="insufficient credits — top up your wallet to generate more",
+        )
+
     provider, model_name, display = PROVIDER_MAP[req.model]
     system_msg = MODE_SYSTEMS[req.mode]
     session_id = f"{user['user_id']}-{req.mode}-{uuid.uuid4().hex[:8]}"
@@ -237,11 +308,10 @@ async def generate(req: GenerateRequest, authorization: Optional[str] = Header(N
             api_key=EMERGENT_LLM_KEY, session_id=session_id, system_message=system_msg
         ).with_model(provider, model_name)
         out = await chat.send_message(UserMessage(text=req.prompt))
-        if hasattr(out, "content"):
-            text = out.content
-        else:
-            text = str(out)
+        text = getattr(out, "content", None) or str(out)
     except Exception as e:
+        # Refund credit on generation failure
+        await db.users.update_one({"user_id": user["user_id"]}, {"$inc": {"credits": 1}})
         logger.exception("LLM call failed")
         raise HTTPException(status_code=502, detail=f"llm error: {e}")
 
@@ -253,6 +323,7 @@ async def generate(req: GenerateRequest, authorization: Optional[str] = Header(N
         "prompt": req.prompt,
         "output": cleaned,
         "raw": text,
+        "credits_remaining": updated.get("credits", 0) - 0,  # post-decrement value (returned doc already decremented)
     }
 
 
@@ -321,10 +392,267 @@ async def delete_creation(creation_id: str, authorization: Optional[str] = Heade
     return {"ok": True}
 
 
+# ============= WALLET & PAYMENTS =============
+
+@api.get("/wallet")
+async def wallet(authorization: Optional[str] = Header(None)):
+    user = await get_current_user(authorization)
+    return {
+        "credits": user.get("credits", 0),
+        "is_admin": bool(user.get("is_admin")),
+        "plans": [
+            {"id": "monthly", "label": "MONTHLY PRO", "amount_inr": 1000, "credits": 1000, "description": "₹1000 → 1000 credits"},
+            {"id": "topup_100", "label": "TOP-UP 100", "amount_inr": 100, "credits": 100, "description": "₹100 → 100 credits"},
+            {"id": "topup_500", "label": "TOP-UP 500", "amount_inr": 500, "credits": 500, "description": "₹500 → 500 credits"},
+        ],
+        "rate": {"credits_per_inr": 1},
+        "razorpay_enabled": bool(razorpay_client),
+        "upi_enabled": bool(MERCHANT_UPI_ID),
+    }
+
+
+class UPIIntentRequest(BaseModel):
+    amount_inr: int = Field(ge=1, le=100000)
+
+
+@api.post("/payments/upi/intent")
+async def create_upi_intent(body: UPIIntentRequest, authorization: Optional[str] = Header(None)):
+    """Create a pending UPI payment record and return the upi:// deep link + QR payload."""
+    user = await get_current_user(authorization)
+    if not MERCHANT_UPI_ID:
+        raise HTTPException(status_code=503, detail="UPI not configured")
+    payment_id = f"pay_upi_{uuid.uuid4().hex[:14]}"
+    credits = body.amount_inr  # 1 INR = 1 credit
+    now = datetime.now(timezone.utc)
+
+    # Build canonical upi:// link
+    note = f"LEO credits {credits}"
+    upi_uri = (
+        f"upi://pay?pa={quote(MERCHANT_UPI_ID)}"
+        f"&pn={quote(MERCHANT_NAME)}"
+        f"&am={body.amount_inr}.00"
+        f"&cu=INR"
+        f"&tn={quote(note)}"
+        f"&tr={payment_id}"
+    )
+
+    await db.payments.insert_one(
+        {
+            "payment_id": payment_id,
+            "user_id": user["user_id"],
+            "user_email": user["email"],
+            "method": "upi_intent",
+            "amount_inr": body.amount_inr,
+            "credits": credits,
+            "status": "pending",  # pending → utr_submitted → approved | rejected
+            "upi_id": MERCHANT_UPI_ID,
+            "utr": None,
+            "created_at": now,
+        }
+    )
+    return {
+        "payment_id": payment_id,
+        "amount_inr": body.amount_inr,
+        "credits": credits,
+        "upi_uri": upi_uri,
+        "upi_id": MERCHANT_UPI_ID,
+        "merchant_name": MERCHANT_NAME,
+        "note": note,
+    }
+
+
+class UTRSubmitRequest(BaseModel):
+    payment_id: str
+    utr: str = Field(min_length=6, max_length=24)
+
+
+@api.post("/payments/upi/submit-utr")
+async def submit_utr(body: UTRSubmitRequest, authorization: Optional[str] = Header(None)):
+    user = await get_current_user(authorization)
+    p = await db.payments.find_one({"payment_id": body.payment_id, "user_id": user["user_id"]}, {"_id": 0})
+    if not p:
+        raise HTTPException(status_code=404, detail="payment not found")
+    if p["status"] not in ("pending", "utr_submitted"):
+        raise HTTPException(status_code=400, detail=f"cannot submit UTR; status={p['status']}")
+    utr = body.utr.strip().upper()
+    await db.payments.update_one(
+        {"payment_id": body.payment_id},
+        {"$set": {"utr": utr, "status": "utr_submitted", "utr_submitted_at": datetime.now(timezone.utc)}},
+    )
+    return {"ok": True, "payment_id": body.payment_id, "status": "utr_submitted"}
+
+
+# ---------- Razorpay ----------
+class RzpOrderRequest(BaseModel):
+    amount_inr: int = Field(ge=1, le=100000)
+
+
+@api.post("/payments/razorpay/order")
+async def razorpay_order(body: RzpOrderRequest, authorization: Optional[str] = Header(None)):
+    user = await get_current_user(authorization)
+    if not razorpay_client:
+        raise HTTPException(status_code=503, detail="razorpay not configured")
+    amount_paise = body.amount_inr * 100
+    receipt = f"leo_{uuid.uuid4().hex[:24]}"[:40]
+    try:
+        order = razorpay_client.order.create(
+            {
+                "amount": amount_paise,
+                "currency": "INR",
+                "receipt": receipt,
+                "payment_capture": 1,
+                "notes": {"user_id": user["user_id"], "email": user["email"], "credits": str(body.amount_inr)},
+            }
+        )
+    except Exception as e:
+        logger.exception("razorpay order failed")
+        raise HTTPException(status_code=502, detail=f"razorpay order failed: {e}")
+
+    payment_id = f"pay_rzp_{uuid.uuid4().hex[:14]}"
+    await db.payments.insert_one(
+        {
+            "payment_id": payment_id,
+            "user_id": user["user_id"],
+            "user_email": user["email"],
+            "method": "razorpay",
+            "amount_inr": body.amount_inr,
+            "credits": body.amount_inr,
+            "status": "pending",
+            "rzp_order_id": order["id"],
+            "rzp_payment_id": None,
+            "rzp_signature": None,
+            "created_at": datetime.now(timezone.utc),
+        }
+    )
+    return {
+        "payment_id": payment_id,
+        "rzp_order_id": order["id"],
+        "rzp_key_id": RAZORPAY_KEY_ID,
+        "amount_inr": body.amount_inr,
+        "amount_paise": amount_paise,
+        "merchant_name": MERCHANT_NAME,
+        "user_email": user["email"],
+        "user_name": user["name"],
+    }
+
+
+class RzpVerifyRequest(BaseModel):
+    payment_id: str  # our internal id
+    rzp_order_id: str
+    rzp_payment_id: str
+    rzp_signature: str
+
+
+@api.post("/payments/razorpay/verify")
+async def razorpay_verify(body: RzpVerifyRequest, authorization: Optional[str] = Header(None)):
+    user = await get_current_user(authorization)
+    if not razorpay_client:
+        raise HTTPException(status_code=503, detail="razorpay not configured")
+    p = await db.payments.find_one({"payment_id": body.payment_id, "user_id": user["user_id"]}, {"_id": 0})
+    if not p:
+        raise HTTPException(status_code=404, detail="payment not found")
+    if p["status"] == "approved":
+        return {"ok": True, "already_approved": True, "credits": p["credits"]}
+
+    # Verify HMAC-SHA256
+    expected = hmac.new(
+        RAZORPAY_KEY_SECRET.encode(),
+        f"{body.rzp_order_id}|{body.rzp_payment_id}".encode(),
+        hashlib.sha256,
+    ).hexdigest()
+    if not hmac.compare_digest(expected, body.rzp_signature):
+        await db.payments.update_one(
+            {"payment_id": body.payment_id},
+            {"$set": {"status": "rejected", "rejected_reason": "bad signature"}},
+        )
+        raise HTTPException(status_code=400, detail="signature verification failed")
+
+    now = datetime.now(timezone.utc)
+    await db.payments.update_one(
+        {"payment_id": body.payment_id},
+        {
+            "$set": {
+                "rzp_payment_id": body.rzp_payment_id,
+                "rzp_signature": body.rzp_signature,
+                "status": "approved",
+                "approved_at": now,
+            }
+        },
+    )
+    await db.users.update_one({"user_id": user["user_id"]}, {"$inc": {"credits": p["credits"]}})
+    new_user = await db.users.find_one({"user_id": user["user_id"]}, {"_id": 0, "credits": 1})
+    return {"ok": True, "credits_added": p["credits"], "credits_balance": new_user.get("credits", 0)}
+
+
+@api.get("/payments/me")
+async def my_payments(authorization: Optional[str] = Header(None)):
+    user = await get_current_user(authorization)
+    cursor = db.payments.find({"user_id": user["user_id"]}, {"_id": 0}).sort("created_at", -1).limit(100)
+    items = []
+    async for d in cursor:
+        if isinstance(d.get("created_at"), datetime):
+            d["created_at"] = d["created_at"].isoformat()
+        if isinstance(d.get("approved_at"), datetime):
+            d["approved_at"] = d["approved_at"].isoformat()
+        if isinstance(d.get("utr_submitted_at"), datetime):
+            d["utr_submitted_at"] = d["utr_submitted_at"].isoformat()
+        items.append(d)
+    return {"items": items}
+
+
+# ---------- Admin (manual UPI approval) ----------
+@api.get("/admin/payments/pending")
+async def admin_pending(authorization: Optional[str] = Header(None)):
+    await require_admin(authorization)
+    cursor = (
+        db.payments.find({"status": {"$in": ["utr_submitted", "pending"]}}, {"_id": 0})
+        .sort("created_at", -1)
+        .limit(200)
+    )
+    items = []
+    async for d in cursor:
+        if isinstance(d.get("created_at"), datetime):
+            d["created_at"] = d["created_at"].isoformat()
+        if isinstance(d.get("utr_submitted_at"), datetime):
+            d["utr_submitted_at"] = d["utr_submitted_at"].isoformat()
+        items.append(d)
+    return {"items": items}
+
+
+@api.post("/admin/payments/{payment_id}/approve")
+async def admin_approve(payment_id: str, authorization: Optional[str] = Header(None)):
+    admin = await require_admin(authorization)
+    p = await db.payments.find_one({"payment_id": payment_id}, {"_id": 0})
+    if not p:
+        raise HTTPException(status_code=404, detail="not found")
+    if p["status"] == "approved":
+        return {"ok": True, "already_approved": True}
+    now = datetime.now(timezone.utc)
+    await db.payments.update_one(
+        {"payment_id": payment_id},
+        {"$set": {"status": "approved", "approved_at": now, "approved_by": admin["email"]}},
+    )
+    await db.users.update_one({"user_id": p["user_id"]}, {"$inc": {"credits": p["credits"]}})
+    return {"ok": True, "credits_added": p["credits"]}
+
+
+@api.post("/admin/payments/{payment_id}/reject")
+async def admin_reject(payment_id: str, authorization: Optional[str] = Header(None)):
+    admin = await require_admin(authorization)
+    p = await db.payments.find_one({"payment_id": payment_id}, {"_id": 0})
+    if not p:
+        raise HTTPException(status_code=404, detail="not found")
+    await db.payments.update_one(
+        {"payment_id": payment_id},
+        {"$set": {"status": "rejected", "rejected_at": datetime.now(timezone.utc), "rejected_by": admin["email"]}},
+    )
+    return {"ok": True}
+
+
 # ---------- Health ----------
 @api.get("/")
 async def root():
-    return {"service": "leo-ai", "status": "ok"}
+    return {"service": "leo-ai", "status": "ok", "razorpay": bool(razorpay_client), "upi": bool(MERCHANT_UPI_ID)}
 
 
 app.include_router(api)
